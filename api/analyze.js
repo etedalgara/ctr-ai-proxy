@@ -1,19 +1,56 @@
-// Vercel Serverless Function: POST /api/analyze
-// پاسخ: تحلیل فارسی بر اساس داده‌های CTR/Position/Benchmarks
+// api/analyze.js  (Vercel Serverless Function)
 
 import OpenAI from "openai";
 
+// CORS helper
+function setCors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+}
+
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
+  setCors(res);
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method Not Allowed" });
+  }
 
   try {
-    let body = req.body;
-    if (typeof body === "string") {
-      try { body = JSON.parse(body); } catch { body = {}; }
+    // --- read body robustly (works even if req.body is undefined) ---
+    let raw = "";
+    if (req.body) {
+      raw = typeof req.body === "string" ? req.body : JSON.stringify(req.body);
+    } else {
+      raw = await new Promise((resolve, reject) => {
+        let data = "";
+        req.setEncoding("utf8");
+        req.on("data", (chunk) => (data += chunk));
+        req.on("end", () => resolve(data || "{}"));
+        req.on("error", reject);
+      });
     }
+
+    let body = {};
+    try {
+      body = JSON.parse(raw || "{}");
+    } catch {
+      return res.status(400).json({ error: "Invalid JSON body" });
+    }
+
     const { meta = {}, benchmarks = [], summary = {}, outliers = {} } = body;
 
-    // ضد سوءاستفاده: محدودسازی اندازه ورودی
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: "OPENAI_API_KEY is not set on server" });
+    }
+    if (!Array.isArray(benchmarks) || benchmarks.length === 0) {
+      return res.status(400).json({ error: "benchmarks[] is required" });
+    }
+
+    // sanity limits to avoid huge payloads
     if (benchmarks.length > 300) {
       return res.status(413).json({ error: "Too many benchmarks" });
     }
@@ -21,35 +58,47 @@ export default async function handler(req, res) {
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
     const prompt =
-`تو یک تحلیلگر سئو هستی و باید بر اساس نرخ کلیک (CTR) و جایگاه صفحات در گوگل، یک تحلیل فارسیِ خلاصه و قابل‌اقدام ارائه بدهی.
-خروجی را با لحن روشن و سرراست بده؛ شامل:
-- ۵ بینش کلیدی کوتاه
-- ۵ اقدام اولویت‌دار (۱ تا ۵)
-- ۳ تست A/B پیشنهادی برای بهبود CTR
+`تو یک تحلیلگر سئو هستی. بر اساس CTR و جایگاه‌ها تحلیل فارسی و قابل‌اقدام بده.
+خروجی مطلوب:
+- ۵ بینش کلیدی
+- ۵ اقدام اولویت‌دار
+- ۳ تست A/B پیشنهادی
 
-مشخصات دیتاست: ${meta?.datasetName ?? "n/a"} | تعداد ردیف: ${meta?.rows ?? 0}
-Benchmarks: ${JSON.stringify(benchmarks)}
-میانگین CTR به تفکیک جایگاه: ${JSON.stringify(summary?.byPos ?? [])}
-نمونه‌های زیرِ معیار: ${JSON.stringify((outliers.underperform ?? []).slice(0, 25))}
-نمونه‌های بالای معیار: ${JSON.stringify((outliers.overperform ?? []).slice(0, 25))}
-نمونه‌های نزدیک مرز: ${JSON.stringify((outliers.borderline ?? []).slice(0, 25))}
+داده:
+meta=${JSON.stringify(meta)}
+benchmarks=${JSON.stringify(benchmarks)}
+byPos=${JSON.stringify(summary?.byPos ?? [])}
+under=${JSON.stringify((outliers.underperform ?? []).slice(0, 25))}
+over=${JSON.stringify((outliers.overperform ?? []).slice(0, 25))}
+border=${JSON.stringify((outliers.borderline ?? []).slice(0, 25))}`;
 
-قواعد:
-- اگر داده‌ای ناکامل است، فرضیه‌سازی نکن؛ اشاره کن که نیاز به داده بیشتر است.
-- از اعداد تقریبی (٪) برای رساندن پیام استفاده کن.
-- کاملاً فارسی پاسخ بده.`;
+    // timeout guard
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), 45000);
 
-    const resp = await client.responses.create({
-      model: "gpt-4o-mini",
-      input: prompt,
-    });
+    let text = "";
+    try {
+      const resp = await client.responses.create({
+        model: "gpt-4o-mini",
+        input: prompt,
+        // signal: ac.signal,   // uncomment when SDK supports AbortController here
+      });
+      text = resp.output_text ?? "";
+    } catch (e) {
+      clearTimeout(t);
+      // bubble up OpenAI error detail
+      return res.status(502).json({
+        error: "OpenAI request failed",
+        detail: e?.message ?? String(e),
+      });
+    }
+    clearTimeout(t);
 
-    const text = resp.output_text ?? "خطا در دریافت پاسخ از مدل.";
+    if (!text) {
+      return res.status(500).json({ error: "Empty response from model" });
+    }
 
-    return res.status(200).json({
-      summaryText: text,
-      topActions: []
-    });
+    return res.status(200).json({ summaryText: text, topActions: [] });
   } catch (e) {
     return res.status(500).json({ error: e?.message ?? "Server error" });
   }
