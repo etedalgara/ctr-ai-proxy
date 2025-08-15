@@ -8,7 +8,7 @@ export const maxDuration = 60;
 
 const OPENAI_URL = "https://api.openai.com/v1/responses";
 const MODEL = "gpt-4o-mini";
-const MAX_OUTPUT_TOKENS = 1200;
+const MAX_OUTPUT_TOKENS = 600;
 
 function slimPayload(p) {
   const clone = JSON.parse(JSON.stringify(p || {}));
