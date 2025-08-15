@@ -1,19 +1,17 @@
-// api/analyze.js  — Serverless (Node.js) to avoid edge timeout
+// api/analyze.js — Serverless (Node.js) runtime (correct value is "nodejs")
 
 export const config = {
-  runtime: "nodejs18.x",    // << از Edge به Node تغییر کرد
-  regions: ["fra1"],        // نزدیک ایران (همان دیتاسنتر خطا)
+  runtime: "nodejs",     // ✅ مقدار درست
+  regions: ["fra1"],     // می‌تونی حذفش هم بکنی؛ اختیاری
 };
-export const maxDuration = 60; // سقف اجرای فانکشن (Hobby معمولا تا 10s اعمال می‌شود، ولی بهتر از Edge است)
+export const maxDuration = 60;
 
 const OPENAI_URL = "https://api.openai.com/v1/responses";
 const MODEL = "gpt-4o-mini";
 const MAX_OUTPUT_TOKENS = 400;
 
-// ---------- helpers ----------
 function slimPayload(p) {
   const clone = JSON.parse(JSON.stringify(p || {}));
-  // 10 آیتم برای صرفه‌جویی در توکن و زمان پاسخ
   if (clone?.outliers) {
     for (const k of ["underperform", "overperform", "borderline"]) {
       if (Array.isArray(clone.outliers[k])) {
@@ -21,7 +19,7 @@ function slimPayload(p) {
       }
     }
   }
-  const shorten = (s) =>
+  const short = (s) =>
     typeof s === "string" && s.length > 120 ? s.slice(0, 117) + "…" : s;
 
   for (const k of ["underperform", "overperform", "borderline"]) {
@@ -29,9 +27,10 @@ function slimPayload(p) {
       if (typeof it.ctr === "number") it.ctr = +it.ctr.toFixed(4);
       if (typeof it.min === "number") it.min = +it.min.toFixed(4);
       if (typeof it.max === "number") it.max = +it.max.toFixed(4);
-      if (it.url) it.url = shorten(it.url);
+      if (it.url) it.url = short(it.url);
     });
   }
+
   if (Array.isArray(clone?.summary?.byPos)) {
     clone.summary.byPos = clone.summary.byPos
       .map((r) => ({
@@ -44,10 +43,8 @@ function slimPayload(p) {
   return clone;
 }
 
-// درخواست به OpenAI با timeout و retry سبک
 async function callOpenAI(body, key, controller, maxAttempts = 3) {
   let lastErr = null;
-
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const res = await fetch(OPENAI_URL, {
@@ -59,17 +56,13 @@ async function callOpenAI(body, key, controller, maxAttempts = 3) {
         body: JSON.stringify(body),
         signal: controller.signal,
       });
-
       if (res.status === 200) return await res.json();
 
-      // روی 429/5xx یک بار دیگر تلاش می‌کنیم
       if (res.status === 429 || res.status >= 500) {
         lastErr = { status: res.status, body: await res.text() };
-        // backoff بسیار کوتاه تا تایم‌اوت کل فانکشن نگذرد
         await new Promise((r) => setTimeout(r, 700 * attempt));
         continue;
       }
-      // خطاهای دیگر را بازگردان
       return { error: `OpenAI HTTP ${res.status}`, detail: await res.text() };
     } catch (e) {
       lastErr = e;
@@ -80,9 +73,7 @@ async function callOpenAI(body, key, controller, maxAttempts = 3) {
 }
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).send("Only POST");
-  }
+  if (req.method !== "POST") return res.status(405).send("Only POST");
 
   let payload;
   try {
@@ -96,17 +87,16 @@ export default async function handler(req, res) {
   }
 
   const key = process.env.OPENAI_API_KEY;
-  if (!key) {
-    return res.status(500).json({ error: "OPENAI_API_KEY missing" });
-  }
+  if (!key) return res.status(500).json({ error: "OPENAI_API_KEY missing" });
 
   const slim = slimPayload(payload);
 
-  const sys = `شما یک تحلیلگر سئو هستید. با فارسی رسمی و روان، نتیجه CTR را خلاصه و توصیه‌های عملی بده.
-خروجی را در 3 تا 6 بخش کوتاه با تیتر واضح بده و حداکثر 400 توکن.`;
+  const sys = `شما یک تحلیلگر سئو هستید. با فارسی روان و رسمی، نتیجه CTR را خلاصه و توصیه‌های عملی بده.
+خروجی 3 تا 6 بخش کوتاه با تیتر واضح؛ حداکثر ~400 توکن.`;
+
   const usr = `دیتای خلاصه‌شده:
 ${JSON.stringify(slim)}
-راهنما: نقاط ضعف/قوت و 1-2 اقدام سریع برای هر مورد.`;
+راهنما: نقاط ضعف/قوت و برای هر مورد 1-2 اقدام سریع بده.`;
 
   const body = {
     model: MODEL,
@@ -118,7 +108,7 @@ ${JSON.stringify(slim)}
     temperature: 0.3,
   };
 
-  // تایم‌اوت سفت‌وسخت برای کل درخواست به OpenAI (مثلاً 18 ثانیه)
+  // time budget برای تماس با OpenAI
   const controller = new AbortController();
   const overallTimeout = setTimeout(() => controller.abort(), 18000);
 
@@ -128,7 +118,11 @@ ${JSON.stringify(slim)}
   if (result?.error) {
     return res
       .status(504)
-      .json({ summaryText: `AI error: ${result.error} ${result.detail ? "• " + JSON.stringify(result.detail) : ""}` });
+      .json({
+        summaryText: `AI error: ${result.error}${
+          result.detail ? " • " + JSON.stringify(result.detail) : ""
+        }`,
+      });
   }
 
   const text =
