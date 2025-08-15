@@ -1,134 +1,102 @@
-// api/analyze.js — Serverless (Node.js) runtime (correct value is "nodejs")
+import formidable from "formidable";
+import * as XLSX from "xlsx";
+import OpenAI from "openai";
 
+// برای اینکه Vercel فایل آپلود رو درست بخونه
 export const config = {
-  runtime: "nodejs",     // ✅ مقدار درست
-  regions: ["fra1"],     // می‌تونی حذفش هم بکنی؛ اختیاری
+  api: {
+    bodyParser: false,
+  },
 };
-export const maxDuration = 60;
 
-const OPENAI_URL = "https://api.openai.com/v1/responses";
-const MODEL = "gpt-4o-mini";
-const MAX_OUTPUT_TOKENS = 600;
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
-function slimPayload(p) {
-  const clone = JSON.parse(JSON.stringify(p || {}));
-  if (clone?.outliers) {
-    for (const k of ["underperform", "overperform", "borderline"]) {
-      if (Array.isArray(clone.outliers[k])) {
-        clone.outliers[k] = clone.outliers[k].slice(0, 10);
-      }
-    }
-  }
-  const short = (s) =>
-    typeof s === "string" && s.length > 120 ? s.slice(0, 117) + "…" : s;
+// تابع برای خواندن فایل اکسل
+const readExcelFile = async (filePath) => {
+  const workbook = XLSX.readFile(filePath);
+  const sheetName = workbook.SheetNames[0];
+  const worksheet = workbook.Sheets[sheetName];
+  return XLSX.utils.sheet_to_json(worksheet);
+};
 
-  for (const k of ["underperform", "overperform", "borderline"]) {
-    (clone?.outliers?.[k] || []).forEach((it) => {
-      if (typeof it.ctr === "number") it.ctr = +it.ctr.toFixed(4);
-      if (typeof it.min === "number") it.min = +it.min.toFixed(4);
-      if (typeof it.max === "number") it.max = +it.max.toFixed(4);
-      if (it.url) it.url = short(it.url);
-    });
-  }
+// فرمت‌دهی خروجی AI به صورت راست‌چین و با ایموجی
+const formatAIResponse = (rawText) => {
+  const sections = rawText
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter((line) => line);
 
-  if (Array.isArray(clone?.summary?.byPos)) {
-    clone.summary.byPos = clone.summary.byPos
-      .map((r) => ({
-        pos: r.pos,
-        avg: typeof r.avg === "number" ? +r.avg.toFixed(4) : r.avg,
-        n: r.n,
-      }))
-      .slice(0, 20);
-  }
-  return clone;
-}
+  return sections
+    .map((line) => {
+      if (line.startsWith("بینش‌های کلیدی")) return "🟦 **بینش‌های کلیدی:**";
+      if (line.startsWith("پیشنهادات")) return "🟩 **پیشنهادات:**";
+      if (line.startsWith("خلاصه کلی")) return "🟨 **خلاصه کلی:**";
+      return line;
+    })
+    .join("\n\n");
+};
 
-async function callOpenAI(body, key, controller, maxAttempts = 3) {
-  let lastErr = null;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      const res = await fetch(OPENAI_URL, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${key}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-      if (res.status === 200) return await res.json();
-
-      if (res.status === 429 || res.status >= 500) {
-        lastErr = { status: res.status, body: await res.text() };
-        await new Promise((r) => setTimeout(r, 700 * attempt));
-        continue;
-      }
-      return { error: `OpenAI HTTP ${res.status}`, detail: await res.text() };
-    } catch (e) {
-      lastErr = e;
-      await new Promise((r) => setTimeout(r, 500));
-    }
-  }
-  return { error: "OpenAI request failed after retries", detail: lastErr };
-}
+// پردازش اکسل و آماده‌سازی داده‌ها
+const processExcelData = (data) => {
+  return data.map((row) => {
+    return {
+      campaign: row["Campaign"] || row["کمپین"] || "",
+      impressions: row["Impressions"] || row["نمایش"] || 0,
+      clicks: row["Clicks"] || row["کلیک"] || 0,
+      ctr: row["CTR"] || row["ctr"] || row["Ctr"] || 0, // بدون درصدسازی
+      cost: row["Cost"] || row["هزینه"] || 0,
+    };
+  });
+};
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).send("Only POST");
-
-  let payload;
-  try {
-    payload = req.body ?? (await new Promise((r) => {
-      let data = "";
-      req.on("data", (c) => (data += c));
-      req.on("end", () => r(JSON.parse(data || "{}")));
-    }));
-  } catch {
-    return res.status(400).json({ error: "Bad JSON body" });
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
   }
 
-  const key = process.env.OPENAI_API_KEY;
-  if (!key) return res.status(500).json({ error: "OPENAI_API_KEY missing" });
+  const form = new formidable.IncomingForm();
 
-  const slim = slimPayload(payload);
+  form.parse(req, async (err, fields, files) => {
+    if (err) return res.status(500).json({ error: "File parsing failed" });
 
-  const sys = `شما یک تحلیلگر سئو هستید. با فارسی روان و رسمی، نتیجه CTR را کامل تحلیل کن 
-و توصیه‌های عملی و جزئی ارائه بده. خروجی ۵ تا ۱۰ بخش مفصل با تیتر واضح؛ حداکثر ~${MAX_OUTPUT_TOKENS} توکن.`;
+    try {
+      // ۱- خواندن فایل اکسل
+      const filePath = files.file.filepath;
+      const rawData = await readExcelFile(filePath);
+      const processedData = processExcelData(rawData);
 
-  const usr = `دیتای خلاصه‌شده:
-${JSON.stringify(slim)}
-راهنما: نقاط ضعف/قوت و برای هر مورد 1-2 اقدام سریع بده.`;
+      // ۲- ساخت متن برای AI
+      const aiPrompt = `
+        این داده‌های کمپین تبلیغاتی هستند:
+        ${JSON.stringify(processedData, null, 2)}
+        
+        لطفا تحلیل را در سه بخش ارائه کن:
+        1. بینش‌های کلیدی
+        2. پیشنهادات
+        3. خلاصه کلی
 
-  const body = {
-    model: MODEL,
-    input: [
-      { role: "system", content: sys },
-      { role: "user", content: usr },
-    ],
-    max_output_tokens: MAX_OUTPUT_TOKENS,
-    temperature: 0.3,
-  };
+        همه متن باید فارسی و راست‌چین باشد.
+        هر بخش را با تیتر مشخص کن.
+      `;
 
-  // time budget برای تماس با OpenAI
-  const controller = new AbortController();
-  const overallTimeout = setTimeout(() => controller.abort(), 18000);
-
-  const result = await callOpenAI(body, key, controller);
-  clearTimeout(overallTimeout);
-
-  if (result?.error) {
-    return res
-      .status(504)
-      .json({
-        summaryText: `AI error: ${result.error}${
-          result.detail ? " • " + JSON.stringify(result.detail) : ""
-        }`,
+      // ۳- درخواست به OpenAI
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: aiPrompt }],
       });
-  }
 
-  const text =
-    result?.output?.[0]?.content?.map?.((p) => p?.text)?.join("") ||
-    result?.output_text ||
-    "";
+      const aiText = completion.choices[0].message.content;
+      const formattedAI = formatAIResponse(aiText);
 
-  return res.status(200).json({ summaryText: text });
+      return res.status(200).json({
+        data: processedData,
+        ai_analysis: formattedAI,
+      });
+    } catch (error) {
+      console.error("AI Analysis Error:", error);
+      return res.status(500).json({ error: "AI Analysis Failed" });
+    }
+  });
 }
