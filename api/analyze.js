@@ -8,7 +8,7 @@ export const maxDuration = 60;
 
 const OPENAI_URL = "https://api.openai.com/v1/responses";
 const MODEL = "gpt-4o-mini";
-const MAX_OUTPUT_TOKENS = 400;
+const MAX_OUTPUT_TOKENS = 1200;
 
 function slimPayload(p) {
   const clone = JSON.parse(JSON.stringify(p || {}));
@@ -91,8 +91,8 @@ export default async function handler(req, res) {
 
   const slim = slimPayload(payload);
 
-  const sys = `شما یک تحلیلگر سئو هستید. با فارسی روان و رسمی، نتیجه CTR را خلاصه و توصیه‌های عملی بده.
-خروجی 3 تا 6 بخش کوتاه با تیتر واضح؛ حداکثر ~400 توکن.`;
+  const sys = `شما یک تحلیلگر سئو هستید. با فارسی روان و رسمی، نتیجه CTR را کامل تحلیل کن 
+و توصیه‌های عملی و جزئی ارائه بده. خروجی ۵ تا ۱۰ بخش مفصل با تیتر واضح؛ حداکثر ~${MAX_OUTPUT_TOKENS} توکن.`;
 
   const usr = `دیتای خلاصه‌شده:
 ${JSON.stringify(slim)}
