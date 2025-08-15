@@ -1,105 +1,81 @@
-// api/analyze.js  (Vercel Serverless Function)
+// api/analyze.js
+export const config = { runtime: 'edge' }; // Edge = استارت سریع
 
-import OpenAI from "openai";
-
-// CORS helper
-function setCors(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-}
-
-export default async function handler(req, res) {
-  setCors(res);
-
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
-  }
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method Not Allowed" });
-  }
-
+export default async function handler(req) {
   try {
-    // --- read body robustly (works even if req.body is undefined) ---
-    let raw = "";
-    if (req.body) {
-      raw = typeof req.body === "string" ? req.body : JSON.stringify(req.body);
-    } else {
-      raw = await new Promise((resolve, reject) => {
-        let data = "";
-        req.setEncoding("utf8");
-        req.on("data", (chunk) => (data += chunk));
-        req.on("end", () => resolve(data || "{}"));
-        req.on("error", reject);
+    if (req.method !== 'POST') {
+      return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+        status: 405, headers: { 'content-type': 'application/json' }
       });
     }
 
-    let body = {};
-    try {
-      body = JSON.parse(raw || "{}");
-    } catch {
-      return res.status(400).json({ error: "Invalid JSON body" });
-    }
+    const body = await req.json().catch(() => ({}));
+    const { meta, benchmarks, summary, outliers } = body || {};
 
-    const { meta = {}, benchmarks = [], summary = {}, outliers = {} } = body;
+    // پرامپت کوتاه و نتیجه جمع‌وجور تا سریع پاسخ بده
+    const prompt = [
+      'خلاصه تشخیصی سئو از CTR بر اساس داده‌ها. خروجی را فهرست شماره‌دار فارسی بده:',
+      'هر مورد: یک عنوان کوتاه در خط اول و 2–4 جمله در خطوط بعد.',
+      'بدون **…**. مختصر و اجرایی.',
+      `meta: ${JSON.stringify(meta || {})}`,
+      `benchmarks: ${JSON.stringify(benchmarks || [])}`,
+      `summary: ${JSON.stringify(summary || {})}`,
+      `outliers: ${JSON.stringify(outliers || {})}`
+    ].join('\n');
 
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({ error: "OPENAI_API_KEY is not set on server" });
-    }
-    if (!Array.isArray(benchmarks) || benchmarks.length === 0) {
-      return res.status(400).json({ error: "benchmarks[] is required" });
-    }
-
-    // sanity limits to avoid huge payloads
-    if (benchmarks.length > 300) {
-      return res.status(413).json({ error: "Too many benchmarks" });
-    }
-
-    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-    const prompt =
-`تو یک تحلیلگر سئو هستی. بر اساس CTR و جایگاه‌ها تحلیل فارسی و قابل‌اقدام بده.
-خروجی مطلوب:
-- ۵ بینش کلیدی
-- ۵ اقدام اولویت‌دار
-- ۳ تست A/B پیشنهادی
-
-داده:
-meta=${JSON.stringify(meta)}
-benchmarks=${JSON.stringify(benchmarks)}
-byPos=${JSON.stringify(summary?.byPos ?? [])}
-under=${JSON.stringify((outliers.underperform ?? []).slice(0, 25))}
-over=${JSON.stringify((outliers.overperform ?? []).slice(0, 25))}
-border=${JSON.stringify((outliers.borderline ?? []).slice(0, 25))}`;
-
-    // timeout guard
-    const ac = new AbortController();
-    const t = setTimeout(() => ac.abort(), 45000);
-
-    let text = "";
-    try {
-      const resp = await client.responses.create({
-        model: "gpt-4o-mini",
-        input: prompt,
-        // signal: ac.signal,   // uncomment when SDK supports AbortController here
-      });
-      text = resp.output_text ?? "";
-    } catch (e) {
-      clearTimeout(t);
-      // bubble up OpenAI error detail
-      return res.status(502).json({
-        error: "OpenAI request failed",
-        detail: e?.message ?? String(e),
+    // فراخوانی OpenAI
+    const key = process.env.OPENAI_API_KEY;
+    if (!key) {
+      return new Response(JSON.stringify({ error: 'OPENAI_API_KEY missing' }), {
+        status: 500, headers: { 'content-type': 'application/json' }
       });
     }
+
+    // محدودیت‌ها برای سرعت/هزینه
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 40000); // 40s سقف پاسخ از OpenAI
+    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'authorization': `Bearer ${key}`,
+        'content-type': 'application/json'
+      },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',          // سریع/ارزان
+        max_tokens: 600,               // خروجی کوتاه
+        temperature: 0.3,
+        messages: [
+          { role: 'system', content: 'You are an SEO analyst. Respond in Persian (fa-IR).' },
+          { role: 'user', content: prompt }
+        ]
+      })
+    }).catch(e => ({ ok: false, status: 499, json: async () => ({ error: String(e) }) }));
     clearTimeout(t);
 
-    if (!text) {
-      return res.status(500).json({ error: "Empty response from model" });
+    const data = await resp.json().catch(() => ({}));
+
+    if (!resp.ok) {
+      // همیشه JSON استاندارد برگردون تا اپ تایم‌اوت نشه
+      return new Response(JSON.stringify({
+        error: 'openai_error',
+        status: resp.status,
+        detail: data
+      }), { status: 200, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } });
     }
 
-    return res.status(200).json({ summaryText: text, topActions: [] });
+    const text = data?.choices?.[0]?.message?.content?.trim?.() || '۱. داده برای تحلیل کافی نبود.';
+
+    return new Response(JSON.stringify({ summaryText: text }), {
+      status: 200,
+      headers: { 'content-type': 'application/json', 'cache-control': 'no-store' }
+    });
+
   } catch (e) {
-    return res.status(500).json({ error: e?.message ?? "Server error" });
+    // هر خطایی رخ بده، JSON بده
+    return new Response(JSON.stringify({ error: 'server_error', detail: String(e) }), {
+      status: 200,
+      headers: { 'content-type': 'application/json', 'cache-control': 'no-store' }
+    });
   }
 }
