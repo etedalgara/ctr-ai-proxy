@@ -1,8 +1,8 @@
-// api/analyze.js — Serverless (Node.js) runtime (correct value is "nodejs")
+// api/analyze.js — Serverless (Node.js) runtime (no-percent, raw numbers)
 
 export const config = {
-  runtime: "nodejs",     // ✅ مقدار درست
-  regions: ["fra1"],     // می‌تونی حذفش هم بکنی؛ اختیاری
+  runtime: "nodejs",
+  regions: ["fra1"], // optional
 };
 export const maxDuration = 60;
 
@@ -10,36 +10,105 @@ const OPENAI_URL = "https://api.openai.com/v1/responses";
 const MODEL = "gpt-4o-mini";
 const MAX_OUTPUT_TOKENS = 600;
 
+// ---- helpers: normalize raw numbers (no percent semantics) ----
+function toLatinDigits(s) {
+  if (typeof s !== "string") return s;
+  const map = {
+    "۰":"0","۱":"1","۲":"2","۳":"3","۴":"4","۵":"5","۶":"6","۷":"7","۸":"8","۹":"9",
+    "٠":"0","١":"1","٢":"2","٣":"3","٤":"4","٥":"5","٦":"6","٧":"7","٨":"8","٩":"9",
+  };
+  return s.replace(/[۰-۹٠-٩]/g, (d) => map[d] ?? d);
+}
+
+function normalizeRawNumber(v) {
+  if (typeof v === "number") return v;
+  if (typeof v === "string") {
+    let s = toLatinDigits(v).trim();
+    // remove percent symbols ONLY (no scaling)
+    s = s.replace(/[%٪]/g, "");
+    // remove thousand separators and unify decimal
+    s = s.replace(/[,\u066C\u066B\u066B\u066C\u200F\u200E]/g, "");
+    s = s.replace(/[٫،]/g, "."); // Persian/Arabic decimal marks → dot
+    const n = parseFloat(s);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+// Slim & sanitize payload (keep counts small, coerce numbers RAW)
 function slimPayload(p) {
   const clone = JSON.parse(JSON.stringify(p || {}));
+
+  // outliers: limit to 10 and coerce numeric fields as RAW
   if (clone?.outliers) {
     for (const k of ["underperform", "overperform", "borderline"]) {
       if (Array.isArray(clone.outliers[k])) {
-        clone.outliers[k] = clone.outliers[k].slice(0, 10);
+        clone.outliers[k] = clone.outliers[k]
+          .slice(0, 10)
+          .map((it) => {
+            const out = { ...it };
+            if (out.ctr != null) {
+              const n = normalizeRawNumber(out.ctr);
+              if (n != null) out.ctr = +n; // no scaling
+            }
+            if (out.min != null) {
+              const n = normalizeRawNumber(out.min);
+              if (n != null) out.min = +n;
+            }
+            if (out.max != null) {
+              const n = normalizeRawNumber(out.max);
+              if (n != null) out.max = +n;
+            }
+            // shorten long URLs for token saving only
+            if (typeof out.url === "string" && out.url.length > 120) {
+              out.url = out.url.slice(0, 117) + "…";
+            }
+            return out;
+          });
       }
     }
   }
-  const short = (s) =>
-    typeof s === "string" && s.length > 120 ? s.slice(0, 117) + "…" : s;
 
-  for (const k of ["underperform", "overperform", "borderline"]) {
-    (clone?.outliers?.[k] || []).forEach((it) => {
-      if (typeof it.ctr === "number") it.ctr = +it.ctr.toFixed(4);
-      if (typeof it.min === "number") it.min = +it.min.toFixed(4);
-      if (typeof it.max === "number") it.max = +it.max.toFixed(4);
-      if (it.url) it.url = short(it.url);
+  // summary.byPos: coerce avg to RAW number and trim list
+  if (Array.isArray(clone?.summary?.byPos)) {
+    clone.summary.byPos = clone.summary.byPos
+      .slice(0, 20)
+      .map((r) => {
+        const pos = r.pos;
+        const avg = normalizeRawNumber(r.avg);
+        const n = r.n;
+        return {
+          pos,
+          avg: avg != null ? +avg : r.avg,
+          n,
+        };
+      });
+  }
+
+  // benchmarks: ensure numbers are raw (if present)
+  if (Array.isArray(clone?.benchmarks)) {
+    clone.benchmarks = clone.benchmarks.map((b) => {
+      const out = { ...b };
+      if (out.from != null) {
+        const n = normalizeRawNumber(out.from);
+        if (n != null) out.from = +n;
+      }
+      if (out.to != null) {
+        const n = normalizeRawNumber(out.to);
+        if (n != null) out.to = +n;
+      }
+      if (out.min != null) {
+        const n = normalizeRawNumber(out.min);
+        if (n != null) out.min = +n;
+      }
+      if (out.max != null) {
+        const n = normalizeRawNumber(out.max);
+        if (n != null) out.max = +n;
+      }
+      return out;
     });
   }
 
-  if (Array.isArray(clone?.summary?.byPos)) {
-    clone.summary.byPos = clone.summary.byPos
-      .map((r) => ({
-        pos: r.pos,
-        avg: typeof r.avg === "number" ? +r.avg.toFixed(4) : r.avg,
-        n: r.n,
-      }))
-      .slice(0, 20);
-  }
   return clone;
 }
 
@@ -91,12 +160,16 @@ export default async function handler(req, res) {
 
   const slim = slimPayload(payload);
 
- const sys = `شما یک تحلیلگر سئو هستید. با فارسی روان و رسمی، نتیجه CTR را کامل تحلیل کن 
-و توصیه‌های عملی و جزئی ارائه بده. خروجی ۵ بخش  با تیتر واضح؛ حداکثر ~${MAX_OUTPUT_TOKENS} توکن.`;
+  const sys = `شما یک تحلیلگر سئو هستید. فقط با «اعداد خام» کار کنید.
+هیچ تبدیل درصدی انجام ندهید، از علامت % استفاده نکنید، و اعداد را همان‌طور که هستند تفسیر کنید.
+خروجی را فارسیِ روان و رسمی بنویسید، حداکثر ~${MAX_OUTPUT_TOKENS} توکن، با تیترهای واضح.`;
 
-  const usr = `دیتای خلاصه‌شده:
+  const usr = `داده‌ها (پاک‌سازی شده و بدون درصد):
 ${JSON.stringify(slim)}
-راهنما: نقاط ضعف/قوت و برای هر مورد 1-2 اقدام سریع بده.`;
+دستورالعمل:
+- هیچ مقیاس/تبدیلی روی اعداد انجام نده.
+- از نماد % استفاده نکن.
+- برای هر بخش 1–2 اقدام سریع پیشنهاد بده (عملی و کوتاه).`;
 
   const body = {
     model: MODEL,
@@ -108,7 +181,6 @@ ${JSON.stringify(slim)}
     temperature: 0.3,
   };
 
-  // time budget برای تماس با OpenAI
   const controller = new AbortController();
   const overallTimeout = setTimeout(() => controller.abort(), 18000);
 
@@ -116,13 +188,11 @@ ${JSON.stringify(slim)}
   clearTimeout(overallTimeout);
 
   if (result?.error) {
-    return res
-      .status(504)
-      .json({
-        summaryText: `AI error: ${result.error}${
-          result.detail ? " • " + JSON.stringify(result.detail) : ""
-        }`,
-      });
+    return res.status(504).json({
+      summaryText: `AI error: ${result.error}${
+        result.detail ? " • " + JSON.stringify(result.detail) : ""
+      }`,
+    });
   }
 
   const text =
