@@ -1,4 +1,4 @@
-// api/analyze.js — Serverless (Node.js) runtime (RAW numbers, 2 decimals only if fractional)
+// api/analyze.js — Serverless (Node.js) runtime (RAW numbers, tolerance + color bands)
 
 export const config = {
   runtime: "nodejs",
@@ -8,9 +8,9 @@ export const maxDuration = 60;
 
 const OPENAI_URL = "https://api.openai.com/v1/responses";
 const MODEL = "gpt-4o-mini";
-const MAX_OUTPUT_TOKENS = 600;
+const MAX_OUTPUT_TOKENS = 700;
 
-// --------- helpers: number normalization (no percent semantics) ----------
+// --------- helpers ----------
 function toLatinDigits(s) {
   if (typeof s !== "string") return s;
   const map = {
@@ -24,11 +24,9 @@ function normalizeRawNumber(v) {
   if (typeof v === "number") return v;
   if (typeof v === "string") {
     let s = toLatinDigits(v).trim();
-    // remove percent symbols ONLY (no scaling)
-    s = s.replace(/[%٪]/g, "");
-    // remove thousand separators / LRM/RLM, unify decimal
+    s = s.replace(/[%٪]/g, ""); // فقط حذف %
     s = s.replace(/[,\u066C\u200F\u200E]/g, "");
-    s = s.replace(/[٫،]/g, "."); // Persian/Arabic decimal → dot
+    s = s.replace(/[٫،]/g, ".");
     const n = parseFloat(s);
     return Number.isFinite(n) ? n : null;
   }
@@ -41,84 +39,73 @@ function roundIfNeeded(num) {
   return Number.isInteger(num) ? num : parseFloat(num.toFixed(2));
 }
 
-// --------- payload slimming + coercion ----------
+// --------- payload slimming ----------
 function slimPayload(p) {
   const clone = JSON.parse(JSON.stringify(p || {}));
 
-  // outliers
+  // handle outliers
   if (clone?.outliers) {
     for (const k of ["underperform", "overperform", "borderline"]) {
       if (Array.isArray(clone.outliers[k])) {
-        clone.outliers[k] = clone.outliers[k]
-          .slice(0, 10)
-          .map((it) => {
-            const out = { ...it };
-            if (out.ctr != null) {
-              const n = normalizeRawNumber(out.ctr);
-              if (n != null) out.ctr = roundIfNeeded(n);
+        clone.outliers[k] = clone.outliers[k].slice(0, 10).map((it) => {
+          const out = { ...it };
+          for (const fld of ["ctr", "min", "max"]) {
+            if (out[fld] != null) {
+              const n = normalizeRawNumber(out[fld]);
+              if (n != null) out[fld] = roundIfNeeded(n);
             }
-            if (out.min != null) {
-              const n = normalizeRawNumber(out.min);
-              if (n != null) out.min = roundIfNeeded(n);
-            }
-            if (out.max != null) {
-              const n = normalizeRawNumber(out.max);
-              if (n != null) out.max = roundIfNeeded(n);
-            }
-            // shorten long URLs just to save tokens
-            if (typeof out.url === "string" && out.url.length > 120) {
-              out.url = out.url.slice(0, 117) + "…";
-            }
-            return out;
-          });
+          }
+          if (typeof out.url === "string" && out.url.length > 120) {
+            out.url = out.url.slice(0, 117) + "…";
+          }
+          return out;
+        });
       }
     }
   }
 
   // summary.byPos
   if (Array.isArray(clone?.summary?.byPos)) {
-    clone.summary.byPos = clone.summary.byPos
-      .slice(0, 20)
-      .map((r) => {
-        const pos = r.pos;
-        const avgNum = normalizeRawNumber(r.avg);
-        const n = r.n;
-        return {
-          pos,
-          avg: avgNum != null ? roundIfNeeded(avgNum) : r.avg,
-          n,
-        };
-      });
+    clone.summary.byPos = clone.summary.byPos.slice(0, 20).map((r) => {
+      const avgNum = normalizeRawNumber(r.avg);
+      return {
+        pos: r.pos,
+        avg: avgNum != null ? roundIfNeeded(avgNum) : r.avg,
+        n: r.n,
+      };
+    });
   }
 
   // benchmarks
   if (Array.isArray(clone?.benchmarks)) {
     clone.benchmarks = clone.benchmarks.map((b) => {
       const out = { ...b };
-      if (out.from != null) {
-        const n = normalizeRawNumber(out.from);
-        if (n != null) out.from = roundIfNeeded(n);
-      }
-      if (out.to != null) {
-        const n = normalizeRawNumber(out.to);
-        if (n != null) out.to = roundIfNeeded(n);
-      }
-      if (out.min != null) {
-        const n = normalizeRawNumber(out.min);
-        if (n != null) out.min = roundIfNeeded(n);
-      }
-      if (out.max != null) {
-        const n = normalizeRawNumber(out.max);
-        if (n != null) out.max = roundIfNeeded(n);
+      for (const fld of ["from", "to", "min", "max"]) {
+        if (out[fld] != null) {
+          const n = normalizeRawNumber(out[fld]);
+          if (n != null) out[fld] = roundIfNeeded(n);
+        }
       }
       return out;
     });
   }
 
+  // tolerance + colors
+  if (clone?.settings) {
+    if (clone.settings.tolerance != null) {
+      clone.settings.tolerance = roundIfNeeded(
+        normalizeRawNumber(clone.settings.tolerance)
+      );
+    }
+    if (Array.isArray(clone.settings.colors)) {
+      clone.settings.colors = clone.settings.colors.slice(0, 5);
+    }
+  }
+
   return clone;
 }
 
-// --------- OpenAI call with tiny retry/backoff ----------
+// --------- OpenAI call ----------
 async function callOpenAI(body, key, controller, maxAttempts = 3) {
   let lastErr = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -154,11 +141,13 @@ export default async function handler(req, res) {
 
   let payload;
   try {
-    payload = req.body ?? (await new Promise((r) => {
-      let data = "";
-      req.on("data", (c) => (data += c));
-      req.on("end", () => r(JSON.parse(data || "{}")));
-    }));
+    payload =
+      req.body ??
+      (await new Promise((r) => {
+        let data = "";
+        req.on("data", (c) => (data += c));
+        req.on("end", () => r(JSON.parse(data || "{}")));
+      }));
   } catch {
     return res.status(400).json({ error: "Bad JSON body" });
   }
@@ -168,17 +157,20 @@ export default async function handler(req, res) {
 
   const slim = slimPayload(payload);
 
-  const sys = `شما یک تحلیلگر سئو هستید. فقط با «اعداد خام» کار کنید.
-هیچ تبدیل درصدی انجام ندهید، از علامت % استفاده نکنید، و اعداد را همان‌طور که هستند تفسیر کنید.
-اگر عدد صحیح است بدون اعشار بماند؛ اگر اعشاری بود حداکثر تا دو رقم اعشار.
-خروجی را فارسی روان و رسمی بنویسید، حداکثر ~${MAX_OUTPUT_TOKENS} توکن، با تیترهای واضح.`;
+  const sys = `شما یک تحلیلگر سئو هستید.
+با داده‌های خام (بدون تبدیل درصد یا مقیاس‌دهی) کار کنید.
+- هیچ نماد % استفاده نشود.
+- اعداد صحیح بدون اعشار بمانند.
+- اعداد اعشاری حداکثر تا دو رقم اعشار باشند.
+- اگر تلورانس و رنگ‌ها وجود داشتند، تحلیل خود را بر اساس آن‌ها هم اضافه کنید.
+خروجی فارسی، روان و رسمی با تیترهای شفاف، حداکثر ~${MAX_OUTPUT_TOKENS} توکن.`;
 
-  const usr = `داده‌ها (پاک‌سازی‌شده، با قانون نمایش: صحیح بدون اعشار / اعشاری تا دو رقم):
+  const usr = `داده‌ها (پاک‌سازی‌شده):
 ${JSON.stringify(slim)}
 دستورالعمل:
-- هیچ مقیاس/تبدیلی روی اعداد انجام نده.
-- از نماد % استفاده نکن.
-- برای هر بخش 1–2 اقدام سریع پیشنهاد بده (عملی و کوتاه).`;
+- هیچ مقیاس یا تبدیل روی اعداد نده.
+- برای هر بخش ۱–۲ اقدام سریع و عملی پیشنهاد بده.
+- اگر colors و tolerance موجود بود، آن‌ها را در تحلیل دخیل کن.`;
 
   const body = {
     model: MODEL,
